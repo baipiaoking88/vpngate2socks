@@ -17,6 +17,11 @@ start_microsocks() {
     fi
     microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
     MICROSOCKS_PID=$!
+    sleep 0.3
+    if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
+        log "microsocks failed to start"
+        MICROSOCKS_PID=""
+    fi
 }
 cleanup() {
     trap - EXIT TERM INT
@@ -73,8 +78,8 @@ filter_by_ip_type() {
 }' /tmp/ip_records.txt > /tmp/match_ips.txt
 
     if [ -s /tmp/match_ips.txt ]; then
-        awk -F'|' 'NR==FNR{ips[$1];next} $1 in ips' /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt
-        awk -F'|' 'NR==FNR{ips[$1];next} !($1 in ips)' /tmp/match_ips.txt "$nodes_file" > /tmp/nomatch_nodes.txt
+        awk -F'|' 'NR==FNR{ips[$1]=1;next} $1 in ips' /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt
+        awk -F'|' 'NR==FNR{ips[$1]=1;next} !($1 in ips)' /tmp/match_ips.txt "$nodes_file" > /tmp/nomatch_nodes.txt
         if [ -s /tmp/match_nodes.txt ]; then
             cat /tmp/match_nodes.txt /tmp/nomatch_nodes.txt > "$nodes_file"
             log "Prioritized $(wc -l < /tmp/match_nodes.txt) ${ip_type} nodes"
@@ -246,10 +251,12 @@ PATCH
 
         kill "$OPENVPN_PID" 2>/dev/null || true
         wait "$OPENVPN_PID" 2>/dev/null || true
+        OPENVPN_PID=""
     else
         log "Failed $ip"
         kill "$OPENVPN_PID" 2>/dev/null || true
         wait "$OPENVPN_PID" 2>/dev/null || true
+        OPENVPN_PID=""
     fi
 done < /tmp/tryorder.txt
 }
