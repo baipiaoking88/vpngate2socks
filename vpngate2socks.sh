@@ -11,10 +11,15 @@ IP_TYPE="${IP_TYPE:-}"
 [ -n "$IP_TYPE" ] && IP_TYPE="${IP_TYPE,,}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+start_microsocks() {
+    microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
+    MICROSOCKS_PID=$!
+}
 cleanup() {
-    kill "${MICROSOCKS_PID:-}" 2>/dev/null || true
     kill "${OPENVPN_PID:-}" 2>/dev/null || true
     wait "${OPENVPN_PID:-}" 2>/dev/null || true
+    kill "${MICROSOCKS_PID:-}" 2>/dev/null || true
+    wait "${MICROSOCKS_PID:-}" 2>/dev/null || true
 }
 trap cleanup EXIT TERM INT
 
@@ -138,11 +143,10 @@ while true; do
     best_ip="${best_line%%|*}"
     log "Best: $best_ip (${best_latency}ms)"
 
-    { echo "$best_line"; grep -v "^$best_ip|" /tmp/sorted.txt || true; } > /tmp/tryorder.txt
+    { echo "$best_line"; awk -F'|' -v ip="$best_ip" '$1 != ip' /tmp/sorted.txt; } > /tmp/tryorder.txt
 
     if [ -z "${MICROSOCKS_PID:-}" ] || ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
-        microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
-        MICROSOCKS_PID=$!
+        start_microsocks
     fi
 
     try_nodes
@@ -202,13 +206,13 @@ PATCH
         echo ""
 
         # Health check: monitor VPN + egress country + microsocks
+        health_fails=0
         while true; do
             sleep "$CHECK_INTERVAL"
 
             kill -0 "$MICROSOCKS_PID" 2>/dev/null || {
                 log "microsocks died, restarting..."
-                microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
-                MICROSOCKS_PID=$!
+                start_microsocks
             }
 
             kill -0 "$OPENVPN_PID" 2>/dev/null || {
@@ -220,8 +224,18 @@ PATCH
                 "http://ip-api.com/json" 2>/dev/null || true)
             egress_cc=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
 
-            if [ -n "$COUNTRY" ] && [ -n "$egress_cc" ] && \
-               [ "$egress_cc" != "$COUNTRY" ]; then
+            if [ -z "$egress_cc" ]; then
+                health_fails=$((health_fails + 1))
+                log "Health check failed ($health_fails/3)"
+                if [ "$health_fails" -ge 3 ]; then
+                    log "Health check failed 3 times, switching..."
+                    break
+                fi
+                continue
+            fi
+            health_fails=0
+
+            if [ -n "$COUNTRY" ] && [ "$egress_cc" != "$COUNTRY" ]; then
                 log "Egress mismatch: $egress_cc != $COUNTRY, switching..."
                 break
             fi
