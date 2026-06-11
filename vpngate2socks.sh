@@ -1,0 +1,160 @@
+#!/bin/bash
+set -euo pipefail
+
+COUNTRY="${COUNTRY:-}"
+PROXY_PORT="${PROXY_PORT:-1080}"
+MAX_NODES="${MAX_NODES:-100}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
+
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+cleanup() { kill "${OPENVPN_PID:-}" 2>/dev/null || true; wait "${OPENVPN_PID:-}" 2>/dev/null || true; }
+trap cleanup EXIT TERM INT
+
+printf "vpn\nvpn\n" > /tmp/auth.txt
+
+outer_loop() {
+while true; do
+    log "=== Fetching nodes ==="
+    curl -sf --max-time 15 "https://www.vpngate.net/api/iphone/" > /tmp/api.txt || {
+        log "Fetch failed, retry in 30s"; sleep 30; continue
+    }
+
+    awk -F',' -v max="$MAX_NODES" '
+    !/^[#*]/ && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && length($NF) > 100 {
+        if (++count > max) exit
+        print $2 "|" $7 "|" ($4+0) "|" $NF
+    }' /tmp/api.txt > /tmp/nodes.txt
+
+    total=$(wc -l < /tmp/nodes.txt)
+    [ "$total" -eq 0 ] && { log "No valid nodes, retry in 30s"; sleep 30; continue; }
+    log "Got $total nodes"
+
+    if [ -n "$COUNTRY" ]; then
+        grep -i "^[^|]*|${COUNTRY}|" /tmp/nodes.txt > /tmp/filtered.txt 2>/dev/null || true
+        [ -s /tmp/filtered.txt ] || { log "No ${COUNTRY} nodes, retry in 30s"; sleep 30; continue; }
+        mv /tmp/filtered.txt /tmp/nodes.txt
+        log "Filtered: $(wc -l < /tmp/nodes.txt) ${COUNTRY} nodes"
+    fi
+
+    sort -t'|' -k3 -n /tmp/nodes.txt > /tmp/sorted.txt
+    head -20 /tmp/sorted.txt > /tmp/top20.txt
+
+    log "Pinging top 20..."
+    best_line=""; best_latency=99999
+    while IFS='|' read -r ip rest; do
+        t=$(timeout 4 ping -c 1 -W 2 "$ip" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p') || true
+        [ -z "$t" ] && continue
+        t=${t%.*}
+        [ "$t" -gt 0 ] && [ "$t" -lt "$best_latency" ] && {
+            best_latency=$t; best_line="$ip|$rest"
+        }
+    done < /tmp/top20.txt
+
+    if [ -z "$best_line" ]; then
+        log "No ping responses, using top-scored node..."
+        sort -t'|' -k3 -rn /tmp/nodes.txt > /tmp/scored.txt
+        best_line=$(head -1 /tmp/scored.txt)
+        best_latency="?"
+    fi
+
+    best_ip="${best_line%%|*}"
+    log "Best: $best_ip (${best_latency}ms)"
+
+    { echo "$best_line"; grep -v "^$best_ip|" /tmp/sorted.txt || true; } > /tmp/tryorder.txt
+
+    # Start proxy once (keep running across node switches)
+    microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
+    MICROSOCKS_PID=$!
+
+    try_nodes
+    log "All nodes exhausted, re-fetching in 30s..."
+    sleep 30
+done
+}
+
+try_nodes() {
+while IFS='|' read -r ip country ping config; do
+    log "Connecting $ip..."
+
+    echo "$config" | base64 -d > /tmp/config.ovpn 2>/dev/null || continue
+    cat >> /tmp/config.ovpn <<'PATCH'
+auth-user-pass /tmp/auth.txt
+pull-filter ignore "route-ipv6"
+pull-filter ignore "ifconfig-ipv6"
+PATCH
+
+    openvpn --config /tmp/config.ovpn \
+        --auth-user-pass /tmp/auth.txt \
+        --connect-retry-max 1 --connect-timeout 10 --verb 1 \
+        --log /tmp/openvpn.log 2>/dev/null &
+    OPENVPN_PID=$!
+
+    connected=false
+    for _ in $(seq 1 30); do
+        sleep 1
+        if grep -q "Initialization Sequence Completed" /tmp/openvpn.log 2>/dev/null; then
+            connected=true; break
+        fi
+        kill -0 "$OPENVPN_PID" 2>/dev/null || break
+    done
+
+    if [ "$connected" = true ]; then
+        log "Connected to $ip ✓"
+
+        for _ in 1 2 3; do
+            sleep 3
+            geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
+                "http://ip-api.com/json" 2>/dev/null || true)
+            egress_ip=$(echo "$geo" | grep -o '"query":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            egress_cc=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            [ -n "$egress_cc" ] && break
+        done
+        [ -z "$egress_cc" ] && egress_cc="?"
+        [ -z "$egress_ip" ] && egress_ip="checking..."
+
+        echo ""
+        echo "============================================"
+        echo "  vpngate2socks ready"
+        echo "  SOCKS5 :$PROXY_PORT"
+        echo "  Node   : $ip ($country)"
+        echo "  Egress : $egress_ip ($egress_cc)"
+        echo "============================================"
+        echo ""
+
+        # Health check: monitor VPN + egress country + microsocks
+        while true; do
+            sleep "$CHECK_INTERVAL"
+
+            kill -0 "$MICROSOCKS_PID" 2>/dev/null || {
+                log "microsocks died, restarting..."
+                microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
+                MICROSOCKS_PID=$!
+            }
+
+            kill -0 "$OPENVPN_PID" 2>/dev/null || {
+                log "VPN disconnected, switching..."
+                break
+            }
+
+            geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
+                "http://ip-api.com/json" 2>/dev/null || true)
+            egress_cc=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+
+            if [ -n "$COUNTRY" ] && [ -n "$egress_cc" ] && \
+               [ "$egress_cc" != "$(echo "$COUNTRY" | tr '[:lower:]' '[:upper:]')" ]; then
+                log "Egress mismatch: $egress_cc != ${COUNTRY^^}, switching..."
+                break
+            fi
+        done
+
+        kill "$OPENVPN_PID" 2>/dev/null || true
+        wait "$OPENVPN_PID" 2>/dev/null || true
+    else
+        log "Failed $ip"
+        kill "$OPENVPN_PID" 2>/dev/null || true
+        wait "$OPENVPN_PID" 2>/dev/null || true
+    fi
+done < /tmp/tryorder.txt
+}
+
+outer_loop
