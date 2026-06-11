@@ -7,8 +7,15 @@ MAX_NODES="${MAX_NODES:-100}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 IP_TYPE="${IP_TYPE:-}"
 
+[ -n "$COUNTRY" ] && COUNTRY="${COUNTRY^^}"
+[ -n "$IP_TYPE" ] && IP_TYPE="${IP_TYPE,,}"
+
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
-cleanup() { kill "${OPENVPN_PID:-}" 2>/dev/null || true; wait "${OPENVPN_PID:-}" 2>/dev/null || true; }
+cleanup() {
+    kill "${MICROSOCKS_PID:-}" 2>/dev/null || true
+    kill "${OPENVPN_PID:-}" 2>/dev/null || true
+    wait "${OPENVPN_PID:-}" 2>/dev/null || true
+}
 trap cleanup EXIT TERM INT
 
 printf "vpn\nvpn\n" > /tmp/auth.txt
@@ -38,7 +45,6 @@ filter_by_ip_type() {
     sed 's/},{/}\n{/g; s/^\[//; s/\]$//' /tmp/ip_result.json > /tmp/ip_records.txt
 
     awk -v type="$ip_type" '
-BEGIN { type = tolower(type) }
 {
     if (substr($0, 1, 1) == "{") $0 = substr($0, 2)
     if (substr($0, length($0), 1) == "}") $0 = substr($0, 1, length($0) - 1)
@@ -57,8 +63,8 @@ BEGIN { type = tolower(type) }
 }' /tmp/ip_records.txt > /tmp/match_ips.txt
 
     if [ -s /tmp/match_ips.txt ]; then
-        grep -f /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt 2>/dev/null || true
-        grep -v -f /tmp/match_ips.txt "$nodes_file" > /tmp/nomatch_nodes.txt 2>/dev/null || true
+        awk -F'|' 'NR==FNR{ips[$1];next} $1 in ips' /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt
+        awk -F'|' 'NR==FNR{ips[$1];next} !($1 in ips)' /tmp/match_ips.txt "$nodes_file" > /tmp/nomatch_nodes.txt
         if [ -s /tmp/match_nodes.txt ]; then
             cat /tmp/match_nodes.txt /tmp/nomatch_nodes.txt > "$nodes_file"
             log "Prioritized $(wc -l < /tmp/match_nodes.txt) ${ip_type} nodes"
@@ -125,8 +131,7 @@ while true; do
 
     if [ -z "$best_line" ]; then
         log "No ping responses, using top-scored node..."
-        sort -t'|' -k3 -rn /tmp/nodes.txt > /tmp/scored.txt
-        best_line=$(head -1 /tmp/scored.txt)
+        best_line=$(head -1 /tmp/sorted.txt)
         best_latency="?"
     fi
 
@@ -135,9 +140,10 @@ while true; do
 
     { echo "$best_line"; grep -v "^$best_ip|" /tmp/sorted.txt || true; } > /tmp/tryorder.txt
 
-    # Start proxy once (keep running across node switches)
-    microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
-    MICROSOCKS_PID=$!
+    if [ -z "${MICROSOCKS_PID:-}" ] || ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
+        microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
+        MICROSOCKS_PID=$!
+    fi
 
     try_nodes
     log "All nodes exhausted, re-fetching in 30s..."
@@ -215,8 +221,8 @@ PATCH
             egress_cc=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
 
             if [ -n "$COUNTRY" ] && [ -n "$egress_cc" ] && \
-               [ "$egress_cc" != "$(echo "$COUNTRY" | tr '[:lower:]' '[:upper:]')" ]; then
-                log "Egress mismatch: $egress_cc != ${COUNTRY^^}, switching..."
+               [ "$egress_cc" != "$COUNTRY" ]; then
+                log "Egress mismatch: $egress_cc != $COUNTRY, switching..."
                 break
             fi
         done
