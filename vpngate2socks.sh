@@ -67,6 +67,7 @@ with open('/tmp/match_ips.txt', 'w') as f:
 }
 
 outer_loop() {
+local country_retries=0
 while true; do
     log "=== Fetching nodes ==="
     curl -sf --max-time 15 "https://www.vpngate.net/api/iphone/" > /tmp/api.txt || {
@@ -85,9 +86,21 @@ while true; do
 
     if [ -n "$COUNTRY" ]; then
         grep -i "^[^|]*|${COUNTRY}|" /tmp/nodes.txt > /tmp/filtered.txt 2>/dev/null || true
-        [ -s /tmp/filtered.txt ] || { log "No ${COUNTRY} nodes, retry in 30s"; sleep 30; continue; }
-        mv /tmp/filtered.txt /tmp/nodes.txt
-        log "Filtered: $(wc -l < /tmp/nodes.txt) ${COUNTRY} nodes"
+        if [ ! -s /tmp/filtered.txt ]; then
+            country_retries=$((country_retries + 1))
+            if [ "$country_retries" -ge 3 ]; then
+                log "No ${COUNTRY} nodes after ${country_retries} attempts, dropping country filter"
+                country_retries=0
+                COUNTRY=""
+            else
+                log "No ${COUNTRY} nodes, retry in 30s (${country_retries}/3)..."
+                sleep 30; continue
+            fi
+        else
+            country_retries=0
+            mv /tmp/filtered.txt /tmp/nodes.txt
+            log "Filtered: $(wc -l < /tmp/nodes.txt) ${COUNTRY} nodes"
+        fi
     fi
 
     sort -t'|' -k3 -n /tmp/nodes.txt > /tmp/sorted.txt
