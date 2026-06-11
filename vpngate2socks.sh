@@ -217,6 +217,7 @@ PATCH
         health_fails=0
         while true; do
             sleep "$CHECK_INTERVAL"
+            : > /tmp/openvpn.log
 
             if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
                 log "microsocks died, restarting..."
