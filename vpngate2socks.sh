@@ -35,26 +35,27 @@ filter_by_ip_type() {
         log "IP type query failed, skipping"; return
     }
 
-    python3 -c "
-import json
-ip_type = '$ip_type'.lower()
-with open('/tmp/ip_result.json') as f:
-    results = json.load(f)
-match_ips = set()
-for r in results:
-    if r.get('status') != 'success': continue
-    ip = r.get('query', '')
-    if not ip: continue
-    t = 'residential'
-    if r.get('mobile', False): t = 'mobile'
-    elif r.get('proxy', False): t = 'proxy'
-    elif r.get('hosting', False): t = 'hosting'
-    if t == ip_type: match_ips.add(ip)
-    elif ip_type == 'residential' and not r.get('proxy') and not r.get('hosting') and not r.get('mobile'): match_ips.add(ip)
-    elif ip_type == 'hosting' and t == 'hosting': match_ips.add(ip)
-with open('/tmp/match_ips.txt', 'w') as f:
-    for ip in match_ips: f.write(ip + '\n')
-" || { log "IP type classify failed"; return; }
+    awk -v type="$ip_type" '
+BEGIN { type = tolower(type) }
+{
+    gsub(/^\[|\]$/, "")
+    n = split($0, arr, "},{")
+    for (i = 1; i <= n; i++) {
+        rec = arr[i]; gsub(/^\{|\}$/, "", rec)
+        if (rec !~ /"success"/) continue
+        if (match(rec, /"query":"[^"]*"/))
+            ip = substr(rec, RSTART + 9, RLENGTH - 10)
+        else continue
+        mobile = (rec ~ /"mobile":true/)
+        proxy  = (rec ~ /"proxy":true/)
+        hosting = (rec ~ /"hosting":true/)
+        if (mobile) t = "mobile"
+        else if (proxy) t = "proxy"
+        else if (hosting) t = "hosting"
+        else t = "residential"
+        if (t == type) print ip
+    }
+}' /tmp/ip_result.json > /tmp/match_ips.txt
 
     if [ -s /tmp/match_ips.txt ]; then
         grep -f /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt 2>/dev/null || true
