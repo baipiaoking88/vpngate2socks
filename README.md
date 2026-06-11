@@ -7,7 +7,7 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/<your>/vpngate2socks.git
+git clone https://github.com/baipiaoking88/vpngate2socks.git
 cd vpngate2socks
 
 # 启动（自动选最快节点）
