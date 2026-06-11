@@ -9,5 +9,6 @@ services:
       - "127.0.0.1:1080:1080"
     environment:
       - COUNTRY=${COUNTRY:-}
+      - IP_TYPE=${IP_TYPE:-}
       - PROXY_PORT=1080
     restart: unless-stopped

@@ -5,12 +5,66 @@ COUNTRY="${COUNTRY:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 MAX_NODES="${MAX_NODES:-100}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
+IP_TYPE="${IP_TYPE:-}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 cleanup() { kill "${OPENVPN_PID:-}" 2>/dev/null || true; wait "${OPENVPN_PID:-}" 2>/dev/null || true; }
 trap cleanup EXIT TERM INT
 
 printf "vpn\nvpn\n" > /tmp/auth.txt
+
+filter_by_ip_type() {
+    local ip_type="$1"
+    local nodes_file="$2"
+
+    {
+        echo -n '['
+        first=true
+        while IFS='|' read -r ip rest; do
+            $first || echo -n ','
+            first=false
+            echo -n "\"$ip\""
+        done < "$nodes_file"
+        echo ']'
+    } > /tmp/ip_payload.json
+
+    curl -sf --max-time 15 \
+        -X POST -H "Content-Type: application/json" \
+        -d @/tmp/ip_payload.json \
+        "http://ip-api.com/batch?fields=status,query,proxy,hosting,mobile" > /tmp/ip_result.json 2>/dev/null || {
+        log "IP type query failed, skipping"; return
+    }
+
+    python3 -c "
+import json
+ip_type = '$ip_type'.lower()
+with open('/tmp/ip_result.json') as f:
+    results = json.load(f)
+match_ips = set()
+for r in results:
+    if r.get('status') != 'success': continue
+    ip = r.get('query', '')
+    if not ip: continue
+    t = 'residential'
+    if r.get('mobile', False): t = 'mobile'
+    elif r.get('proxy', False): t = 'proxy'
+    elif r.get('hosting', False): t = 'hosting'
+    if t == ip_type: match_ips.add(ip)
+    elif ip_type == 'residential' and not r.get('proxy') and not r.get('hosting') and not r.get('mobile'): match_ips.add(ip)
+    elif ip_type == 'hosting' and t == 'hosting': match_ips.add(ip)
+with open('/tmp/match_ips.txt', 'w') as f:
+    for ip in match_ips: f.write(ip + '\n')
+" || { log "IP type classify failed"; return; }
+
+    if [ -s /tmp/match_ips.txt ]; then
+        grep -f /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt 2>/dev/null || true
+        grep -v -f /tmp/match_ips.txt "$nodes_file" > /tmp/nomatch_nodes.txt 2>/dev/null || true
+        if [ -s /tmp/match_nodes.txt ]; then
+            cat /tmp/match_nodes.txt /tmp/nomatch_nodes.txt > "$nodes_file"
+            log "Prioritized $(wc -l < /tmp/match_nodes.txt) ${ip_type} nodes"
+        fi
+    fi
+}
 
 outer_loop() {
 while true; do
@@ -37,6 +91,11 @@ while true; do
     fi
 
     sort -t'|' -k3 -n /tmp/nodes.txt > /tmp/sorted.txt
+
+    if [ -n "$IP_TYPE" ]; then
+        filter_by_ip_type "$IP_TYPE" /tmp/sorted.txt
+    fi
+
     head -20 /tmp/sorted.txt > /tmp/top20.txt
 
     log "Pinging top 20..."

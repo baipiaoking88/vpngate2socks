@@ -24,6 +24,7 @@ curl --proxy socks5://127.0.0.1:1080 https://ipapi.co/json/
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `COUNTRY` | (所有) | 国家代码过滤，见 Country_code.txt |
+| `IP_TYPE` | (不限制) | IP 类型优先: `residential` / `proxy` / `hosting` |
 | `PROXY_PORT` | 1080 | SOCKS5 代理端口 |
 | `MAX_NODES` | 100 | 每次拉取的最大节点数 |
 | `CHECK_INTERVAL` | 60 | 健康检查间隔（秒） |
