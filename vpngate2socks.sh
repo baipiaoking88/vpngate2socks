@@ -35,27 +35,26 @@ filter_by_ip_type() {
         log "IP type query failed, skipping"; return
     }
 
+    sed 's/},{/}\n{/g; s/^\[//; s/\]$//' /tmp/ip_result.json > /tmp/ip_records.txt
+
     awk -v type="$ip_type" '
 BEGIN { type = tolower(type) }
 {
-    gsub(/^\[|\]$/, "")
-    n = split($0, arr, "},{")
-    for (i = 1; i <= n; i++) {
-        rec = arr[i]; gsub(/^\{|\}$/, "", rec)
-        if (rec !~ /"success"/) continue
-        if (match(rec, /"query":"[^"]*"/))
-            ip = substr(rec, RSTART + 9, RLENGTH - 10)
-        else continue
-        mobile = (rec ~ /"mobile":true/)
-        proxy  = (rec ~ /"proxy":true/)
-        hosting = (rec ~ /"hosting":true/)
-        if (mobile) t = "mobile"
-        else if (proxy) t = "proxy"
-        else if (hosting) t = "hosting"
-        else t = "residential"
-        if (t == type) print ip
-    }
-}' /tmp/ip_result.json > /tmp/match_ips.txt
+    if (substr($0, 1, 1) == "{") $0 = substr($0, 2)
+    if (substr($0, length($0), 1) == "}") $0 = substr($0, 1, length($0) - 1)
+    if ($0 !~ /"success"/) next
+    if (match($0, /"query":"[^"]*"/))
+        ip = substr($0, RSTART + 9, RLENGTH - 10)
+    else next
+    mobile = ($0 ~ /"mobile":true/)
+    proxy  = ($0 ~ /"proxy":true/)
+    hosting = ($0 ~ /"hosting":true/)
+    if (mobile) t = "mobile"
+    else if (proxy) t = "proxy"
+    else if (hosting) t = "hosting"
+    else t = "residential"
+    if (t == type) print ip
+}' /tmp/ip_records.txt > /tmp/match_ips.txt
 
     if [ -s /tmp/match_ips.txt ]; then
         grep -f /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt 2>/dev/null || true
