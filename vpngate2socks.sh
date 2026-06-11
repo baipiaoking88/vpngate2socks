@@ -12,16 +12,21 @@ IP_TYPE="${IP_TYPE:-}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 start_microsocks() {
+    if [ -n "${MICROSOCKS_PID:-}" ] && kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
+        return
+    fi
     microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
     MICROSOCKS_PID=$!
 }
 cleanup() {
+    trap - EXIT TERM INT
     kill "${OPENVPN_PID:-}" 2>/dev/null || true
     wait "${OPENVPN_PID:-}" 2>/dev/null || true
     kill "${MICROSOCKS_PID:-}" 2>/dev/null || true
     wait "${MICROSOCKS_PID:-}" 2>/dev/null || true
 }
-trap cleanup EXIT TERM INT
+trap cleanup EXIT
+trap 'cleanup; exit 0' TERM INT
 
 printf "vpn\nvpn\n" > /tmp/auth.txt
 
@@ -135,7 +140,7 @@ while true; do
     done < /tmp/top20.txt
 
     if [ -z "$best_line" ]; then
-        log "No ping responses, using top-scored node..."
+        log "No ping responses, using lowest-ping node..."
         best_line=$(head -1 /tmp/sorted.txt)
         best_latency="?"
     fi
@@ -145,9 +150,7 @@ while true; do
 
     { echo "$best_line"; awk -F'|' -v ip="$best_ip" '$1 != ip' /tmp/sorted.txt; } > /tmp/tryorder.txt
 
-    if [ -z "${MICROSOCKS_PID:-}" ] || ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
-        start_microsocks
-    fi
+    start_microsocks
 
     try_nodes
     log "All nodes exhausted, re-fetching in 30s..."
@@ -210,10 +213,10 @@ PATCH
         while true; do
             sleep "$CHECK_INTERVAL"
 
-            kill -0 "$MICROSOCKS_PID" 2>/dev/null || {
+            if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
                 log "microsocks died, restarting..."
                 start_microsocks
-            }
+            fi
 
             kill -0 "$OPENVPN_PID" 2>/dev/null || {
                 log "VPN disconnected, switching..."
