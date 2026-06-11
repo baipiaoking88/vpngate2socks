@@ -149,6 +149,7 @@ while IFS='|' read -r ip country ping config; do
     log "Connecting $ip..."
 
     echo "$config" | base64 -d > /tmp/config.ovpn 2>/dev/null || continue
+    : > /tmp/openvpn.log
     cat >> /tmp/config.ovpn <<'PATCH'
 auth-user-pass /tmp/auth.txt
 pull-filter ignore "route-ipv6"
