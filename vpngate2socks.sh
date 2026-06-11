@@ -113,10 +113,11 @@ while true; do
     head -20 /tmp/sorted.txt > /tmp/top20.txt
 
     log "Pinging top 20..."
+    awk -F'|' '{print $1}' /tmp/top20.txt | fping -C1 -t2000 2>/dev/null > /tmp/fping_out.txt
     best_line=""; best_latency=99999
     while IFS='|' read -r ip rest; do
-        t=$(timeout 4 ping -c 1 -W 2 "$ip" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p') || true
-        [ -z "$t" ] && continue
+        t=$(awk -v ip="$ip" '$1 == ip { print $3 }' /tmp/fping_out.txt)
+        [ -z "$t" ] || [ "$t" = "-" ] && continue
         t=${t%.*}
         [ "$t" -gt 0 ] && [ "$t" -lt "$best_latency" ] && {
             best_latency=$t; best_line="$ip|$rest"
