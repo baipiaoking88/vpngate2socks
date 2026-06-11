@@ -112,7 +112,7 @@ while true; do
     head -20 /tmp/sorted.txt > /tmp/top20.txt
 
     log "Pinging top 20..."
-    awk -F'|' '{print $1}' /tmp/top20.txt | fping -C1 -t2000 2>/dev/null > /tmp/fping_out.txt
+    awk -F'|' '{print $1}' /tmp/top20.txt | fping -C1 -t2000 2>/dev/null > /tmp/fping_out.txt || true
     best_line=""; best_latency=99999
     while IFS='|' read -r ip rest; do
         t=$(awk -v ip="$ip" '$1 == ip { print $3 }' /tmp/fping_out.txt)
