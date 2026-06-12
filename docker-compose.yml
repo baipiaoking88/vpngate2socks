@@ -1,6 +1,9 @@
 services:
   vpngate2socks:
+    container_name: vpngate2socks
     build: .
+    # 如果Egress出现异常请取消下面这行注释
+    #network_mode: "bridge"
     cap_add:
       - NET_ADMIN
     devices:
