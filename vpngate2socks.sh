@@ -4,36 +4,108 @@ set -euo pipefail
 COUNTRY="${COUNTRY:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 MAX_NODES="${MAX_NODES:-100}"
+case "$MAX_NODES" in ''|*[!0-9]*) MAX_NODES=100 ;; esac
+if [ "$MAX_NODES" -gt 100 ]; then MAX_NODES=100; fi
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
+case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=60 ;; esac
+if [ "$CHECK_INTERVAL" -lt 10 ] 2>/dev/null; then CHECK_INTERVAL=60; fi
 IP_TYPE="${IP_TYPE:-}"
+
+SOCKS_INT_PORT=10801
+HTTP_INT_PORT=10802
 
 [ -n "$COUNTRY" ] && COUNTRY="${COUNTRY^^}"
 [ -n "$IP_TYPE" ] && IP_TYPE="${IP_TYPE,,}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+isleep() { sleep "$1" & wait $! || true; }
 start_microsocks() {
     if [ -n "${MICROSOCKS_PID:-}" ] && kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
         return
     fi
-    microsocks -i 0.0.0.0 -p "$PROXY_PORT" &
+    wait "${MICROSOCKS_PID:-}" 2>/dev/null || true
+    microsocks -i 127.0.0.1 -p "$SOCKS_INT_PORT" &
     MICROSOCKS_PID=$!
-    sleep 0.3
+    isleep 0.3
     if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
         log "microsocks failed to start"
         MICROSOCKS_PID=""
     fi
 }
+start_tinyproxy() {
+    if [ -n "${TINYPROXY_PID:-}" ] && kill -0 "$TINYPROXY_PID" 2>/dev/null; then
+        return
+    fi
+    wait "${TINYPROXY_PID:-}" 2>/dev/null || true
+    cat > /tmp/tinyproxy.conf <<EOF
+User root
+Group root
+Port $HTTP_INT_PORT
+Listen 127.0.0.1
+Allow 127.0.0.1
+EOF
+    tinyproxy -d -c /tmp/tinyproxy.conf >/dev/null 2>&1 &
+    TINYPROXY_PID=$!
+    isleep 0.3
+    if ! kill -0 "$TINYPROXY_PID" 2>/dev/null; then
+        log "tinyproxy failed to start"
+        TINYPROXY_PID=""
+    fi
+}
+start_haproxy() {
+    if [ -n "${HAPROXY_PID:-}" ] && kill -0 "$HAPROXY_PID" 2>/dev/null; then
+        return
+    fi
+    cat > /tmp/haproxy.cfg <<EOF
+global
+    daemon
+
+defaults
+    mode tcp
+    timeout connect 5000
+    timeout client 86400000
+    timeout server 86400000
+    option tcpka
+
+frontend main
+    bind 0.0.0.0:$PROXY_PORT
+    tcp-request inspect-delay 2000
+    tcp-request content accept if { req.payload(0,1) -m bin 05 }
+    tcp-request content accept
+    use_backend bk_socks if { req.payload(0,1) -m bin 05 }
+    default_backend bk_http
+
+backend bk_socks
+    server s1 127.0.0.1:$SOCKS_INT_PORT
+backend bk_http
+    server h1 127.0.0.1:$HTTP_INT_PORT
+EOF
+    haproxy -f /tmp/haproxy.cfg -p /tmp/haproxy.pid 2>/dev/null || true
+    HAPROXY_PID=$(cat /tmp/haproxy.pid 2>/dev/null || true)
+    isleep 0.3
+    if [ -z "$HAPROXY_PID" ] || ! kill -0 "$HAPROXY_PID" 2>/dev/null; then
+        log "haproxy failed to start"
+        HAPROXY_PID=""
+    fi
+}
+start_proxies() {
+    start_microsocks
+    start_tinyproxy
+    start_haproxy
+}
 cleanup() {
     trap - EXIT TERM INT
+    kill "${HAPROXY_PID:-}" 2>/dev/null || true
+    kill "${TINYPROXY_PID:-}" 2>/dev/null || true
     kill "${OPENVPN_PID:-}" 2>/dev/null || true
-    wait "${OPENVPN_PID:-}" 2>/dev/null || true
     kill "${MICROSOCKS_PID:-}" 2>/dev/null || true
-    wait "${MICROSOCKS_PID:-}" 2>/dev/null || true
+    wait "${TINYPROXY_PID:-}" "${OPENVPN_PID:-}" "${MICROSOCKS_PID:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'cleanup; exit 0' TERM INT
 
 printf "vpn\nvpn\n" > /tmp/auth.txt
+chmod 600 /tmp/auth.txt
 
 filter_by_ip_type() {
     local ip_type="$1"
@@ -92,7 +164,7 @@ local country_retries=0
 while true; do
     log "=== Fetching nodes ==="
     curl -sf --max-time 15 "https://www.vpngate.net/api/iphone/" > /tmp/api.txt || {
-        log "Fetch failed, retry in 30s"; sleep 30; continue
+        log "Fetch failed, retry in 30s"; isleep 30; continue
     }
 
     awk -F',' -v max="$MAX_NODES" '
@@ -102,7 +174,7 @@ while true; do
     }' /tmp/api.txt > /tmp/nodes.txt
 
     total=$(wc -l < /tmp/nodes.txt)
-    [ "$total" -eq 0 ] && { log "No valid nodes, retry in 30s"; sleep 30; continue; }
+    [ "$total" -eq 0 ] && { log "No valid nodes, retry in 30s"; isleep 30; continue; }
     log "Got $total nodes"
 
     if [ -n "$COUNTRY" ]; then
@@ -115,7 +187,7 @@ while true; do
                 COUNTRY=""
             else
                 log "No ${COUNTRY} nodes, retry in 30s (${country_retries}/3)..."
-                sleep 30; continue
+                isleep 30; continue
             fi
         else
             country_retries=0
@@ -155,11 +227,11 @@ while true; do
 
     { echo "$best_line"; awk -F'|' -v ip="$best_ip" '$1 != ip' /tmp/sorted.txt; } > /tmp/tryorder.txt
 
-    start_microsocks
+    start_proxies
 
     try_nodes
     log "All nodes exhausted, re-fetching in 30s..."
-    sleep 30
+    isleep 30
 done
 }
 
@@ -176,14 +248,13 @@ pull-filter ignore "ifconfig-ipv6"
 PATCH
 
     openvpn --config /tmp/config.ovpn \
-        --auth-user-pass /tmp/auth.txt \
-        --connect-retry-max 1 --connect-timeout 10 --verb 1 \
+        --connect-retry-max 1 --connect-timeout 10 --verb 1 --mute 10 \
         --log /tmp/openvpn.log 2>/dev/null &
     OPENVPN_PID=$!
 
     connected=false
     for _ in $(seq 1 30); do
-        sleep 1
+        isleep 1
         if grep -q "Initialization Sequence Completed" /tmp/openvpn.log 2>/dev/null; then
             connected=true; break
         fi
@@ -194,7 +265,7 @@ PATCH
         log "Connected to $ip ✓"
 
         for _ in 1 2 3; do
-            sleep 3
+            isleep 3
             geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
                 "http://ip-api.com/json" 2>/dev/null || true)
             egress_ip=$(echo "$geo" | grep -o '"query":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
@@ -207,24 +278,33 @@ PATCH
         echo ""
         echo "============================================"
         echo "  vpngate2socks ready"
-        echo "  SOCKS5 :$PROXY_PORT"
+        echo "  SOCKS5/HTTP :$PROXY_PORT"
         echo "  Node   : $ip ($country)"
         echo "  Egress : $egress_ip ($egress_cc)"
         echo "============================================"
         echo ""
 
-        # Health check: monitor VPN + egress country + microsocks
+        # Health check: monitor proxies + VPN + egress country
         health_fails=0
         while true; do
-            sleep "$CHECK_INTERVAL"
-            : > /tmp/openvpn.log
+            isleep "$CHECK_INTERVAL"
 
-            if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
+            [ "$(wc -c < /tmp/openvpn.log 2>/dev/null || echo 0)" -gt 1048576 ] && : > /tmp/openvpn.log
+
+            kill -0 "${HAPROXY_PID:-}" 2>/dev/null || {
+                log "haproxy died, restarting..."
+                start_haproxy
+            }
+            if ! kill -0 "${MICROSOCKS_PID:-}" 2>/dev/null; then
                 log "microsocks died, restarting..."
                 start_microsocks
             fi
+            if [ -n "${TINYPROXY_PID:-}" ] && ! kill -0 "${TINYPROXY_PID:-}" 2>/dev/null; then
+                log "tinyproxy died, restarting..."
+                start_tinyproxy
+            fi
 
-            kill -0 "$OPENVPN_PID" 2>/dev/null || {
+            kill -0 "${OPENVPN_PID:-}" 2>/dev/null || {
                 log "VPN disconnected, switching..."
                 break
             }
