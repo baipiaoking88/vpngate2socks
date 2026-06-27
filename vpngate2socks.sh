@@ -4,11 +4,9 @@ set -euo pipefail
 COUNTRY="${COUNTRY:-}"
 PROXY_PORT="${PROXY_PORT:-1080}"
 MAX_NODES="${MAX_NODES:-100}"
-case "$MAX_NODES" in ''|*[!0-9]*) MAX_NODES=100 ;; esac
-if [ "$MAX_NODES" -gt 100 ]; then MAX_NODES=100; fi
+[ "$MAX_NODES" -gt 100 ] 2>/dev/null && MAX_NODES=100
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
-case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=60 ;; esac
-if [ "$CHECK_INTERVAL" -lt 10 ] 2>/dev/null; then CHECK_INTERVAL=60; fi
+[ "$CHECK_INTERVAL" -lt 10 ] 2>/dev/null && CHECK_INTERVAL=60
 IP_TYPE="${IP_TYPE:-}"
 
 SOCKS_INT_PORT=10801
@@ -19,6 +17,7 @@ HTTP_INT_PORT=10802
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 isleep() { sleep "$1" & wait $! || true; }
+jval() { echo "$1" | grep -o "\"$2\":\"[^\"]*\"" | cut -d'"' -f4 || true; }
 start_microsocks() {
     if [ -n "${MICROSOCKS_PID:-}" ] && kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
         return
@@ -26,7 +25,7 @@ start_microsocks() {
     wait "${MICROSOCKS_PID:-}" 2>/dev/null || true
     microsocks -i 127.0.0.1 -p "$SOCKS_INT_PORT" &
     MICROSOCKS_PID=$!
-    isleep 0.3
+    sleep 0.3
     if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
         log "microsocks failed to start"
         MICROSOCKS_PID=""
@@ -46,7 +45,7 @@ Allow 127.0.0.1
 EOF
     tinyproxy -d -c /tmp/tinyproxy.conf >/dev/null 2>&1 &
     TINYPROXY_PID=$!
-    isleep 0.3
+    sleep 0.3
     if ! kill -0 "$TINYPROXY_PID" 2>/dev/null; then
         log "tinyproxy failed to start"
         TINYPROXY_PID=""
@@ -82,7 +81,7 @@ backend bk_http
 EOF
     haproxy -f /tmp/haproxy.cfg -p /tmp/haproxy.pid 2>/dev/null || true
     HAPROXY_PID=$(cat /tmp/haproxy.pid 2>/dev/null || true)
-    isleep 0.3
+    sleep 0.3
     if [ -z "$HAPROXY_PID" ] || ! kill -0 "$HAPROXY_PID" 2>/dev/null; then
         log "haproxy failed to start"
         HAPROXY_PID=""
@@ -111,16 +110,7 @@ filter_by_ip_type() {
     local ip_type="$1"
     local nodes_file="$2"
 
-    {
-        echo -n '['
-        first=true
-        while IFS='|' read -r ip rest; do
-            $first || echo -n ','
-            first=false
-            echo -n "\"$ip\""
-        done < "$nodes_file"
-        echo ']'
-    } > /tmp/ip_payload.json
+    awk -F'|' 'BEGIN{printf "["}{printf "%s\"%s\"",sep,$1;sep=","}END{print "]"}' "$nodes_file" > /tmp/ip_payload.json
 
     curl -sf --max-time 15 \
         -X POST -H "Content-Type: application/json" \
@@ -133,8 +123,6 @@ filter_by_ip_type() {
 
     awk -v type="$ip_type" '
 {
-    if (substr($0, 1, 1) == "{") $0 = substr($0, 2)
-    if (substr($0, length($0), 1) == "}") $0 = substr($0, 1, length($0) - 1)
     if ($0 !~ /"success"/) next
     if (match($0, /"query":"[^"]*"/))
         ip = substr($0, RSTART + 9, RLENGTH - 10)
@@ -150,8 +138,8 @@ filter_by_ip_type() {
 }' /tmp/ip_records.txt > /tmp/match_ips.txt
 
     if [ -s /tmp/match_ips.txt ]; then
-        awk -F'|' 'NR==FNR{ips[$1]=1;next} $1 in ips' /tmp/match_ips.txt "$nodes_file" > /tmp/match_nodes.txt
-        awk -F'|' 'NR==FNR{ips[$1]=1;next} !($1 in ips)' /tmp/match_ips.txt "$nodes_file" > /tmp/nomatch_nodes.txt
+        : > /tmp/match_nodes.txt; : > /tmp/nomatch_nodes.txt
+        awk -F'|' 'NR==FNR{ips[$1]=1;next}{print >($1 in ips?"/tmp/match_nodes.txt":"/tmp/nomatch_nodes.txt")}' /tmp/match_ips.txt "$nodes_file"
         if [ -s /tmp/match_nodes.txt ]; then
             cat /tmp/match_nodes.txt /tmp/nomatch_nodes.txt > "$nodes_file"
             log "Prioritized $(wc -l < /tmp/match_nodes.txt) ${ip_type} nodes"
@@ -268,8 +256,8 @@ PATCH
             isleep 3
             geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
                 "http://ip-api.com/json" 2>/dev/null || true)
-            egress_ip=$(echo "$geo" | grep -o '"query":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
-            egress_cc=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            egress_ip=$(jval "$geo" query)
+            egress_cc=$(jval "$geo" countryCode)
             [ -n "$egress_cc" ] && break
         done
         [ -z "$egress_cc" ] && egress_cc="?"
@@ -311,7 +299,7 @@ PATCH
 
             geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
                 "http://ip-api.com/json" 2>/dev/null || true)
-            egress_cc=$(echo "$geo" | grep -o '"countryCode":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            egress_cc=$(jval "$geo" countryCode)
 
             if [ -z "$egress_cc" ]; then
                 health_fails=$((health_fails + 1))
@@ -330,15 +318,12 @@ PATCH
             fi
         done
 
-        kill "$OPENVPN_PID" 2>/dev/null || true
-        wait "$OPENVPN_PID" 2>/dev/null || true
-        OPENVPN_PID=""
     else
         log "Failed $ip"
-        kill "$OPENVPN_PID" 2>/dev/null || true
-        wait "$OPENVPN_PID" 2>/dev/null || true
-        OPENVPN_PID=""
     fi
+    kill "${OPENVPN_PID:-}" 2>/dev/null || true
+    wait "${OPENVPN_PID:-}" 2>/dev/null || true
+    OPENVPN_PID=""
 done < /tmp/tryorder.txt
 }
 
