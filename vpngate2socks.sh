@@ -254,16 +254,16 @@ PATCH
     if [ "$connected" = true ]; then
         log "Connected to $ip ✓"
 
-        for _ in 1 2 3; do
-            isleep 3
-            geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
+        for _ in 1 2 3 4 5; do
+            isleep 2
+            geo=$(curl -sf --max-time 8 --proxy "socks5h://127.0.0.1:$PROXY_PORT" \
                 "http://ip-api.com/json" 2>/dev/null || true)
             egress_ip=$(jval "$geo" query)
             egress_cc=$(jval "$geo" countryCode)
-            [ -n "$egress_cc" ] && break
+            [ -n "$egress_ip" ] && [ -n "$egress_cc" ] && break
         done
         [ -z "$egress_cc" ] && egress_cc="?"
-        [ -z "$egress_ip" ] && egress_ip="checking..."
+        [ -z "$egress_ip" ] && egress_ip="?"
 
         echo ""
         echo "============================================"
@@ -299,7 +299,71 @@ PATCH
                 elapsed=$(( $(date +%s) - node_start ))
                 if [ "$elapsed" -ge "$ROTATE_INTERVAL" ]; then
                     log "Rotating after ${elapsed}s interval"
-                    break
+                    old_pid=$OPENVPN_PID
+                    old_ip=$ip
+                    old_egress=${egress_ip:-}
+                    # full list except current IP (not only untried tail)
+                    awk -F'|' -v cur="$old_ip" '$1 != cur' /tmp/tryorder.txt > /tmp/rotate_candidates.txt
+                    while IFS='|' read -r next_ip next_country next_ping next_config; do
+                        log "Trying $next_ip (buffer: keep $old_ip)..."
+                        echo "$next_config" | base64 -d > /tmp/rotate_config.ovpn 2>/dev/null || continue
+                        cat >> /tmp/rotate_config.ovpn <<'PATCH'
+auth-user-pass /tmp/auth.txt
+pull-filter ignore "route-ipv6"
+pull-filter ignore "ifconfig-ipv6"
+PATCH
+                        : > /tmp/rotate_openvpn.log
+                        openvpn --config /tmp/rotate_config.ovpn \
+                            --connect-retry-max 1 --connect-timeout 10 --verb 1 --mute 10 \
+                            --log /tmp/rotate_openvpn.log 2>/dev/null &
+                        ROTATE_PID=$!
+                        ok=false
+                        for _ in $(seq 1 30); do
+                            isleep 1
+                            if grep -q "Initialization Sequence Completed" /tmp/rotate_openvpn.log 2>/dev/null; then
+                                ok=true; break
+                            fi
+                            kill -0 "$ROTATE_PID" 2>/dev/null || break
+                        done
+                        if [ "$ok" = true ]; then
+                            new_ip=""; new_cc=""
+                            for _ in 1 2 3 4 5; do
+                                isleep 2
+                                geo=$(curl -sf --max-time 8 --proxy "socks5h://127.0.0.1:$PROXY_PORT" \
+                                    "http://ip-api.com/json" 2>/dev/null || true)
+                                new_ip=$(jval "$geo" query)
+                                new_cc=$(jval "$geo" countryCode)
+                                [ -n "$new_ip" ] && [ -n "$new_cc" ] && break
+                            done
+                            # require usable egress IP different from old public IP
+                            if [ -n "$new_ip" ] && [ -n "$new_cc" ] && [ "$new_ip" != "$old_egress" ]; then
+                                # cutover only after new path verified
+                                kill "$old_pid" 2>/dev/null || true
+                                wait "$old_pid" 2>/dev/null || true
+                                OPENVPN_PID=$ROTATE_PID
+                                ip=$next_ip
+                                country=$next_country
+                                egress_ip=$new_ip
+                                egress_cc=$new_cc
+                                node_start=$(date +%s)
+                                health_fails=0
+                                log "Switched to $next_ip → $new_ip ($new_cc)"
+                                echo ""
+                                echo "============================================"
+                                echo "  vpngate2socks ready"
+                                echo "  SOCKS5/HTTP :$PROXY_PORT"
+                                echo "  Node   : $next_ip ($next_country)"
+                                echo "  Egress : $new_ip ($new_cc)"
+                                echo "============================================"
+                                echo ""
+                                continue 2
+                            fi
+                            log "Egress bad/same on $next_ip, keep old"
+                        fi
+                        kill "$ROTATE_PID" 2>/dev/null || true
+                        wait "$ROTATE_PID" 2>/dev/null || true
+                    done < /tmp/rotate_candidates.txt
+                    log "No alternative node, keeping current"
                 fi
             fi
 
@@ -308,11 +372,12 @@ PATCH
                 break
             }
 
-            geo=$(curl -sf --max-time 5 --proxy "socks5://127.0.0.1:$PROXY_PORT" \
+            geo=$(curl -sf --max-time 8 --proxy "socks5h://127.0.0.1:$PROXY_PORT" \
                 "http://ip-api.com/json" 2>/dev/null || true)
+            egress_ip=$(jval "$geo" query)
             egress_cc=$(jval "$geo" countryCode)
 
-            if [ -z "$egress_cc" ]; then
+            if [ -z "$egress_ip" ] || [ -z "$egress_cc" ]; then
                 health_fails=$((health_fails + 1))
                 log "Health check failed ($health_fails/3)"
                 if [ "$health_fails" -ge 3 ]; then
