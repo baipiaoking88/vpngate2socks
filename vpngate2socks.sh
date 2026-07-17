@@ -8,6 +8,8 @@ MAX_NODES="${MAX_NODES:-100}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 [ "$CHECK_INTERVAL" -lt 10 ] 2>/dev/null && CHECK_INTERVAL=60
 IP_TYPE="${IP_TYPE:-}"
+ROTATE_INTERVAL="${ROTATE_INTERVAL:-}"
+[ -n "$ROTATE_INTERVAL" ] && [ "$ROTATE_INTERVAL" -lt 60 ] 2>/dev/null && ROTATE_INTERVAL=60
 
 SOCKS_INT_PORT=10801
 HTTP_INT_PORT=10802
@@ -274,6 +276,7 @@ PATCH
 
         # Health check: monitor proxies + VPN + egress country
         health_fails=0
+        node_start=$(date +%s)
         while true; do
             isleep "$CHECK_INTERVAL"
 
@@ -290,6 +293,14 @@ PATCH
             if [ -n "${TINYPROXY_PID:-}" ] && ! kill -0 "${TINYPROXY_PID:-}" 2>/dev/null; then
                 log "tinyproxy died, restarting..."
                 start_tinyproxy
+            fi
+
+            if [ -n "$ROTATE_INTERVAL" ]; then
+                elapsed=$(( $(date +%s) - node_start ))
+                if [ "$elapsed" -ge "$ROTATE_INTERVAL" ]; then
+                    log "Rotating after ${elapsed}s interval"
+                    break
+                fi
             fi
 
             kill -0 "${OPENVPN_PID:-}" 2>/dev/null || {

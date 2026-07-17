@@ -13,6 +13,7 @@ services:
     environment:
       - COUNTRY=${COUNTRY:-}
       - IP_TYPE=${IP_TYPE:-}
+      - ROTATE_INTERVAL=${ROTATE_INTERVAL:-}
       - PROXY_PORT=1080
     restart: unless-stopped
     logging:
