@@ -8,6 +8,7 @@ MAX_NODES="${MAX_NODES:-100}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 [ "$CHECK_INTERVAL" -lt 10 ] 2>/dev/null && CHECK_INTERVAL=60
 IP_TYPE="${IP_TYPE:-}"
+EXCLUDE_COUNTRY="${EXCLUDE_COUNTRY:-}"
 ROTATE_INTERVAL="${ROTATE_INTERVAL:-}"
 [ -n "$ROTATE_INTERVAL" ] && [ "$ROTATE_INTERVAL" -lt 60 ] 2>/dev/null && ROTATE_INTERVAL=60
 
@@ -15,6 +16,7 @@ SOCKS_INT_PORT=10801
 HTTP_INT_PORT=10802
 
 [ -n "$COUNTRY" ] && COUNTRY="${COUNTRY^^}"
+[ -n "$EXCLUDE_COUNTRY" ] && EXCLUDE_COUNTRY="${EXCLUDE_COUNTRY^^}" && EXCLUDE_COUNTRY="${EXCLUDE_COUNTRY// /}"
 [ -n "$IP_TYPE" ] && IP_TYPE="${IP_TYPE,,}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -184,6 +186,19 @@ while true; do
             mv /tmp/filtered.txt /tmp/nodes.txt
             log "Filtered: $(wc -l < /tmp/nodes.txt) ${COUNTRY} nodes"
         fi
+    fi
+
+    if [ -n "$EXCLUDE_COUNTRY" ]; then
+        awk -F'|' -v ex="$EXCLUDE_COUNTRY" '
+        BEGIN { n=split(ex,a,","); for(i=1;i<=n;i++) if(a[i]!="") skip[a[i]]=1 }
+        !($2 in skip)
+        ' /tmp/nodes.txt > /tmp/excluded.txt
+        if [ ! -s /tmp/excluded.txt ]; then
+            log "All nodes excluded by EXCLUDE_COUNTRY=$EXCLUDE_COUNTRY, retry in 30s"
+            isleep 30; continue
+        fi
+        mv /tmp/excluded.txt /tmp/nodes.txt
+        log "Excluded $EXCLUDE_COUNTRY: $(wc -l < /tmp/nodes.txt) nodes left"
     fi
 
     sort -t'|' -k3 -n /tmp/nodes.txt > /tmp/sorted.txt

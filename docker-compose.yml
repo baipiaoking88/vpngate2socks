@@ -12,6 +12,7 @@ services:
       - "127.0.0.1:1080:1080"
     environment:
       - COUNTRY=${COUNTRY:-}
+      - EXCLUDE_COUNTRY=${EXCLUDE_COUNTRY:-}
       - IP_TYPE=${IP_TYPE:-}
       - ROTATE_INTERVAL=${ROTATE_INTERVAL:-}
       - PROXY_PORT=1080
