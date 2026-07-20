@@ -11,9 +11,15 @@ IP_TYPE="${IP_TYPE:-}"
 EXCLUDE_COUNTRY="${EXCLUDE_COUNTRY:-}"
 ROTATE_INTERVAL="${ROTATE_INTERVAL:-}"
 [ -n "$ROTATE_INTERVAL" ] && [ "$ROTATE_INTERVAL" -lt 60 ] 2>/dev/null && ROTATE_INTERVAL=60
+USED_IP_MAX="${USED_IP_MAX:-100}"
+[ "$USED_IP_MAX" -lt 1 ] 2>/dev/null && USED_IP_MAX=100
+CONTROL_PORT="${CONTROL_PORT:-1083}"
+ROTATE_COOLDOWN=30
 
 SOCKS_INT_PORT=10801
 HTTP_INT_PORT=10802
+USED_FILE=/tmp/used_ips.txt
+: > "$USED_FILE"
 
 [ -n "$COUNTRY" ] && COUNTRY="${COUNTRY^^}"
 [ -n "$EXCLUDE_COUNTRY" ] && EXCLUDE_COUNTRY="${EXCLUDE_COUNTRY^^}" && EXCLUDE_COUNTRY="${EXCLUDE_COUNTRY// /}"
@@ -22,6 +28,138 @@ HTTP_INT_PORT=10802
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 isleep() { sleep "$1" & wait $! || true; }
 jval() { echo "$1" | grep -o "\"$2\":\"[^\"]*\"" | cut -d'"' -f4 || true; }
+mark_used() {
+    local u="$1"
+    [ -z "$u" ] || [ "$u" = "?" ] && return
+    grep -qxF "$u" "$USED_FILE" 2>/dev/null && return
+    echo "$u" >> "$USED_FILE"
+    local n; n=$(wc -l < "$USED_FILE")
+    if [ "$n" -gt "$USED_IP_MAX" ]; then
+        tail -n "$USED_IP_MAX" "$USED_FILE" > /tmp/used_ips.new
+        mv /tmp/used_ips.new "$USED_FILE"
+    fi
+}
+build_rotate_candidates() {
+    awk -F'|' -v uf="$USED_FILE" '
+        BEGIN{while((getline l < uf)>0)u[l]=1; close(uf)}
+        !($1 in u){print}
+    ' /tmp/tryorder.txt > /tmp/rotate_candidates.txt
+    if [ ! -s /tmp/rotate_candidates.txt ]; then
+        local half=$((USED_IP_MAX / 2))
+        [ "$half" -lt 1 ] && half=1
+        log "Used pool exhausted, drop oldest half ($half keep)"
+        if [ -s "$USED_FILE" ]; then
+            tail -n "$half" "$USED_FILE" > /tmp/used_ips.new
+            mv /tmp/used_ips.new "$USED_FILE"
+        fi
+        awk -F'|' -v uf="$USED_FILE" '
+            BEGIN{while((getline l < uf)>0)u[l]=1; close(uf)}
+            !($1 in u){print}
+        ' /tmp/tryorder.txt > /tmp/rotate_candidates.txt
+    fi
+}
+# buffered rotate: try unused nodes first; cutover only after egress ok
+do_rotate() {
+    local reason="$1"
+    log "Rotating ($reason)"
+    local old_pid=$OPENVPN_PID old_ip=$ip old_egress=${egress_ip:-}
+    build_rotate_candidates
+    while IFS='|' read -r next_ip next_country next_ping next_config; do
+        [ "$next_ip" = "$old_ip" ] && continue
+        log "Trying $next_ip (buffer: keep $old_ip)..."
+        echo "$next_config" | base64 -d > /tmp/rotate_config.ovpn 2>/dev/null || continue
+        cat >> /tmp/rotate_config.ovpn <<'PATCH'
+auth-user-pass /tmp/auth.txt
+pull-filter ignore "route-ipv6"
+pull-filter ignore "ifconfig-ipv6"
+PATCH
+        : > /tmp/rotate_openvpn.log
+        openvpn --config /tmp/rotate_config.ovpn \
+            --connect-retry-max 1 --connect-timeout 10 --verb 1 --mute 10 \
+            --log /tmp/rotate_openvpn.log 2>/dev/null &
+        ROTATE_PID=$!
+        local ok=false
+        for _ in $(seq 1 30); do
+            isleep 1
+            if grep -q "Initialization Sequence Completed" /tmp/rotate_openvpn.log 2>/dev/null; then
+                ok=true; break
+            fi
+            kill -0 "$ROTATE_PID" 2>/dev/null || break
+        done
+        if [ "$ok" = true ]; then
+            local new_ip="" new_cc=""
+            for _ in 1 2 3 4 5; do
+                isleep 2
+                geo=$(curl -sf --max-time 8 --proxy "socks5h://127.0.0.1:$PROXY_PORT" \
+                    "http://ip-api.com/json" 2>/dev/null || true)
+                new_ip=$(jval "$geo" query)
+                new_cc=$(jval "$geo" countryCode)
+                [ -n "$new_ip" ] && [ -n "$new_cc" ] && break
+            done
+            if [ -n "$new_ip" ] && [ -n "$new_cc" ] && [ "$new_ip" != "$old_egress" ]; then
+                kill "$old_pid" 2>/dev/null || true
+                wait "$old_pid" 2>/dev/null || true
+                OPENVPN_PID=$ROTATE_PID
+                ip=$next_ip
+                country=$next_country
+                egress_ip=$new_ip
+                egress_cc=$new_cc
+                mark_used "$next_ip"
+                mark_used "$new_ip"
+                node_start=$(date +%s)
+                health_fails=0
+                log "Switched to $next_ip → $new_ip ($new_cc)"
+                echo ""
+                echo "============================================"
+                echo "  vpngate2socks ready"
+                echo "  SOCKS5/HTTP :$PROXY_PORT"
+                echo "  Node   : $next_ip ($next_country)"
+                echo "  Egress : $new_ip ($new_cc)"
+                echo "============================================"
+                echo ""
+                return 0
+            fi
+            log "Egress bad/same on $next_ip, keep old"
+            mark_used "$next_ip"
+        fi
+        kill "$ROTATE_PID" 2>/dev/null || true
+        wait "$ROTATE_PID" 2>/dev/null || true
+    done < /tmp/rotate_candidates.txt
+    log "No alternative node, keeping current"
+    return 1
+}
+start_control() {
+    if [ -n "${CONTROL_PID:-}" ] && kill -0 "$CONTROL_PID" 2>/dev/null; then
+        return
+    fi
+    cat > /tmp/control_handler.sh <<EOF
+#!/bin/bash
+cool=$ROTATE_COOLDOWN
+# drain HTTP request with short timeout (avoid head -c hang)
+timeout 1 cat >/dev/null 2>&1 || true
+now=\$(date +%s)
+last=\$(cat /tmp/rotate_lock_ts 2>/dev/null || echo 0)
+if [ \$((now - last)) -lt "\$cool" ]; then
+    rem=\$((cool - (now - last)))
+    body="rate limited, wait \${rem}s"
+else
+    echo "\$now" > /tmp/rotate_lock_ts
+    : > /tmp/rotate_request
+    body="ok"
+fi
+printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "\${#body}" "\$body"
+EOF
+    chmod +x /tmp/control_handler.sh
+    ncat -l -k --keep-open -p "$CONTROL_PORT" -c /tmp/control_handler.sh >/dev/null 2>&1 &
+    CONTROL_PID=$!
+    sleep 0.3
+    if ! kill -0 "$CONTROL_PID" 2>/dev/null; then
+        log "control server failed to start"
+        CONTROL_PID=""
+    else
+        log "Control API :$CONTROL_PORT/ (cooldown ${ROTATE_COOLDOWN}s)"
+    fi
+}
 start_microsocks() {
     if [ -n "${MICROSOCKS_PID:-}" ] && kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
         return
@@ -95,6 +233,7 @@ start_proxies() {
     start_microsocks
     start_tinyproxy
     start_haproxy
+    start_control
 }
 cleanup() {
     trap - EXIT TERM INT
@@ -102,7 +241,8 @@ cleanup() {
     kill "${TINYPROXY_PID:-}" 2>/dev/null || true
     kill "${OPENVPN_PID:-}" 2>/dev/null || true
     kill "${MICROSOCKS_PID:-}" 2>/dev/null || true
-    wait "${TINYPROXY_PID:-}" "${OPENVPN_PID:-}" "${MICROSOCKS_PID:-}" 2>/dev/null || true
+    kill "${CONTROL_PID:-}" 2>/dev/null || true
+    wait "${TINYPROXY_PID:-}" "${OPENVPN_PID:-}" "${MICROSOCKS_PID:-}" "${CONTROL_PID:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'cleanup; exit 0' TERM INT
@@ -230,7 +370,19 @@ while true; do
     best_ip="${best_line%%|*}"
     log "Best: $best_ip (${best_latency}ms)"
 
-    { echo "$best_line"; awk -F'|' -v ip="$best_ip" '$1 != ip' /tmp/sorted.txt; } > /tmp/tryorder.txt
+    # unused first, then used (except best which leads)
+    # note: empty used file breaks NR==FNR two-file idiom → use getline
+    {
+        echo "$best_line"
+        awk -F'|' -v best="$best_ip" -v uf="$USED_FILE" '
+            BEGIN{while((getline l < uf)>0)u[l]=1; close(uf)}
+            $1!=best && !($1 in u){print}
+        ' /tmp/sorted.txt
+        awk -F'|' -v best="$best_ip" -v uf="$USED_FILE" '
+            BEGIN{while((getline l < uf)>0)u[l]=1; close(uf)}
+            $1!=best && ($1 in u){print}
+        ' /tmp/sorted.txt
+    } > /tmp/tryorder.txt
 
     start_proxies
 
@@ -279,11 +431,14 @@ PATCH
         done
         [ -z "$egress_cc" ] && egress_cc="?"
         [ -z "$egress_ip" ] && egress_ip="?"
+        mark_used "$ip"
+        [ "$egress_ip" != "?" ] && mark_used "$egress_ip"
 
         echo ""
         echo "============================================"
         echo "  vpngate2socks ready"
         echo "  SOCKS5/HTTP :$PROXY_PORT"
+        echo "  Control:http://127.0.0.1:$CONTROL_PORT/"
         echo "  Node   : $ip ($country)"
         echo "  Egress : $egress_ip ($egress_cc)"
         echo "============================================"
@@ -293,7 +448,18 @@ PATCH
         health_fails=0
         node_start=$(date +%s)
         while true; do
-            isleep "$CHECK_INTERVAL"
+            # poll rotate API every 5s; full health every CHECK_INTERVAL
+            waited=0
+            need_rotate=""
+            while [ "$waited" -lt "$CHECK_INTERVAL" ]; do
+                isleep 5
+                waited=$((waited + 5))
+                if [ -f /tmp/rotate_request ]; then
+                    rm -f /tmp/rotate_request
+                    need_rotate="api"
+                    break
+                fi
+            done
 
             [ "$(wc -c < /tmp/openvpn.log 2>/dev/null || echo 0)" -gt 1048576 ] && : > /tmp/openvpn.log
 
@@ -309,77 +475,19 @@ PATCH
                 log "tinyproxy died, restarting..."
                 start_tinyproxy
             fi
+            kill -0 "${CONTROL_PID:-}" 2>/dev/null || start_control
 
-            if [ -n "$ROTATE_INTERVAL" ]; then
+            if [ -z "$need_rotate" ] && [ -f /tmp/rotate_request ]; then
+                rm -f /tmp/rotate_request
+                need_rotate="api"
+            fi
+            if [ -z "$need_rotate" ] && [ -n "$ROTATE_INTERVAL" ]; then
                 elapsed=$(( $(date +%s) - node_start ))
-                if [ "$elapsed" -ge "$ROTATE_INTERVAL" ]; then
-                    log "Rotating after ${elapsed}s interval"
-                    old_pid=$OPENVPN_PID
-                    old_ip=$ip
-                    old_egress=${egress_ip:-}
-                    # full list except current IP (not only untried tail)
-                    awk -F'|' -v cur="$old_ip" '$1 != cur' /tmp/tryorder.txt > /tmp/rotate_candidates.txt
-                    while IFS='|' read -r next_ip next_country next_ping next_config; do
-                        log "Trying $next_ip (buffer: keep $old_ip)..."
-                        echo "$next_config" | base64 -d > /tmp/rotate_config.ovpn 2>/dev/null || continue
-                        cat >> /tmp/rotate_config.ovpn <<'PATCH'
-auth-user-pass /tmp/auth.txt
-pull-filter ignore "route-ipv6"
-pull-filter ignore "ifconfig-ipv6"
-PATCH
-                        : > /tmp/rotate_openvpn.log
-                        openvpn --config /tmp/rotate_config.ovpn \
-                            --connect-retry-max 1 --connect-timeout 10 --verb 1 --mute 10 \
-                            --log /tmp/rotate_openvpn.log 2>/dev/null &
-                        ROTATE_PID=$!
-                        ok=false
-                        for _ in $(seq 1 30); do
-                            isleep 1
-                            if grep -q "Initialization Sequence Completed" /tmp/rotate_openvpn.log 2>/dev/null; then
-                                ok=true; break
-                            fi
-                            kill -0 "$ROTATE_PID" 2>/dev/null || break
-                        done
-                        if [ "$ok" = true ]; then
-                            new_ip=""; new_cc=""
-                            for _ in 1 2 3 4 5; do
-                                isleep 2
-                                geo=$(curl -sf --max-time 8 --proxy "socks5h://127.0.0.1:$PROXY_PORT" \
-                                    "http://ip-api.com/json" 2>/dev/null || true)
-                                new_ip=$(jval "$geo" query)
-                                new_cc=$(jval "$geo" countryCode)
-                                [ -n "$new_ip" ] && [ -n "$new_cc" ] && break
-                            done
-                            # require usable egress IP different from old public IP
-                            if [ -n "$new_ip" ] && [ -n "$new_cc" ] && [ "$new_ip" != "$old_egress" ]; then
-                                # cutover only after new path verified
-                                kill "$old_pid" 2>/dev/null || true
-                                wait "$old_pid" 2>/dev/null || true
-                                OPENVPN_PID=$ROTATE_PID
-                                ip=$next_ip
-                                country=$next_country
-                                egress_ip=$new_ip
-                                egress_cc=$new_cc
-                                node_start=$(date +%s)
-                                health_fails=0
-                                log "Switched to $next_ip → $new_ip ($new_cc)"
-                                echo ""
-                                echo "============================================"
-                                echo "  vpngate2socks ready"
-                                echo "  SOCKS5/HTTP :$PROXY_PORT"
-                                echo "  Node   : $next_ip ($next_country)"
-                                echo "  Egress : $new_ip ($new_cc)"
-                                echo "============================================"
-                                echo ""
-                                continue 2
-                            fi
-                            log "Egress bad/same on $next_ip, keep old"
-                        fi
-                        kill "$ROTATE_PID" 2>/dev/null || true
-                        wait "$ROTATE_PID" 2>/dev/null || true
-                    done < /tmp/rotate_candidates.txt
-                    log "No alternative node, keeping current"
-                fi
+                [ "$elapsed" -ge "$ROTATE_INTERVAL" ] && need_rotate="interval ${elapsed}s"
+            fi
+            if [ -n "$need_rotate" ]; then
+                do_rotate "$need_rotate" || true
+                continue
             fi
 
             kill -0 "${OPENVPN_PID:-}" 2>/dev/null || {

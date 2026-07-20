@@ -10,11 +10,14 @@ services:
       - /dev/net/tun
     ports:
       - "127.0.0.1:1080:1080"
+      - "127.0.0.1:1083:1083"
     environment:
       - COUNTRY=${COUNTRY:-}
       - EXCLUDE_COUNTRY=${EXCLUDE_COUNTRY:-}
       - IP_TYPE=${IP_TYPE:-}
       - ROTATE_INTERVAL=${ROTATE_INTERVAL:-}
+      - USED_IP_MAX=${USED_IP_MAX:-100}
+      - CONTROL_PORT=${CONTROL_PORT:-1083}
       - PROXY_PORT=1080
     restart: unless-stopped
     logging:

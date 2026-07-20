@@ -36,6 +36,8 @@ curl --proxy http://127.0.0.1:1080 https://ipapi.co/json/
 | `MAX_NODES` | 100 | 每次拉取的最大节点数（上限 100） |
 | `CHECK_INTERVAL` | 60 | 健康检查间隔（秒，最小 10） |
 | `ROTATE_INTERVAL` | (不启用) | 定时更换 IP 间隔（秒，最小 60，配置后自动按间隔轮换节点） |
+| `USED_IP_MAX` | 100 | 已用 IP 记录上限（FIFO，避免重复轮换） |
+| `CONTROL_PORT` | 1083 | 控制端口（仅本机），`curl http://127.0.0.1:1083/` 手动换 IP，30s 冷却 |
 
 ## 工作原理
 
